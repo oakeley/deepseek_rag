@@ -75,19 +75,19 @@ export DOCS_DIR="./documents"
 
 Run the script with default settings:
 ```bash
-python rag_system.py
+python deepRag.py
 ```
 
 ### Command Line Options
 
 1. Specify documents directory:
 ```bash
-python rag_system.py --docs /path/to/documents
+python deepRag.py --docs /path/to/documents
 ```
 
 2. Force reload all documents:
 ```bash
-python rag_system.py --docs /path/to/documents --force-reload
+python deepRag.py --docs /path/to/documents --force-reload
 ```
 
 ### Interactive Commands
@@ -127,7 +127,7 @@ When running the system:
 ## Example Session
 
 ```bash
-$ python rag_system.py --docs ./my_project
+$ python deepRag.py --docs ./my_project
 Welcome to the Interactive Q&A System!
 Type 'exit', 'quit', or press Ctrl+C to end the session.
 Type 'clear' to clear the screen.
