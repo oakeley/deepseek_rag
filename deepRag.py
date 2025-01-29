@@ -41,14 +41,17 @@ class Neo4jKnowledgeGraph:
                 "CREATE CONSTRAINT IF NOT EXISTS FOR (d:Document) REQUIRE d.filepath IS UNIQUE",
                 "CREATE CONSTRAINT IF NOT EXISTS FOR (f:Folder) REQUIRE f.path IS UNIQUE",
                 "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Patch) REQUIRE p.hash IS UNIQUE",
-                "CREATE CONSTRAINT IF NOT EXISTS FOR (c:CodeChange) REQUIRE (c.file, c.line) IS UNIQUE"
+                "CREATE CONSTRAINT IF NOT EXISTS FOR (c:CodeChange) REQUIRE (c.file, c.line) IS UNIQUE",
+                "CREATE CONSTRAINT IF NOT EXISTS FOR (q:Question) REQUIRE q.timestamp IS UNIQUE"
             ]
             
             # Create indexes
             indexes = [
                 "CREATE INDEX document_content IF NOT EXISTS FOR (d:Document) ON (d.content)",
                 "CREATE INDEX patch_content IF NOT EXISTS FOR (p:Patch) ON (p.description)",
-                "CREATE INDEX folder_path IF NOT EXISTS FOR (f:Folder) ON (f.path)"
+                "CREATE INDEX folder_path IF NOT EXISTS FOR (f:Folder) ON (f.path)",
+                "CREATE INDEX question_text IF NOT EXISTS FOR (q:Question) ON (q.text)",
+                "CREATE INDEX answer_text IF NOT EXISTS FOR (a:Answer) ON (a.text)"
             ]
             
             for constraint in constraints:
@@ -124,10 +127,63 @@ class Neo4jKnowledgeGraph:
             metadata=metadata
         )
     
-    def add_patch(self, patch_info: dict):
-        """Add Git patch information to the graph."""
+    def add_qa_pair(self, question: str, answer: str, context_docs: List[str] = None):
+        """Add a question-answer pair to the knowledge graph."""
         with self.driver.session() as session:
-            session.execute_write(self._create_patch_node, patch_info)
+            session.execute_write(self._create_qa_pair, question, answer, context_docs)
+    
+    def _create_qa_pair(self, tx, question: str, answer: str, context_docs: List[str] = None):
+        """Create question and answer nodes with relationships."""
+        timestamp = datetime.now().isoformat()
+        
+        # Create question and answer nodes
+        qa_query = """
+        CREATE (q:Question {
+            text: $question,
+            timestamp: $timestamp
+        })
+        CREATE (a:Answer {
+            text: $answer,
+            timestamp: $timestamp
+        })
+        CREATE (q)-[:HAS_ANSWER]->(a)
+        """
+        
+        tx.run(qa_query,
+            question=question,
+            answer=answer,
+            timestamp=timestamp
+        )
+        
+        # Link to context documents if provided
+        if context_docs:
+            context_query = """
+            MATCH (q:Question {timestamp: $timestamp})
+            MATCH (d:Document)
+            WHERE d.filepath IN $context_docs
+            CREATE (q)-[:USED_CONTEXT]->(d)
+            """
+            
+            tx.run(context_query,
+                timestamp=timestamp,
+                context_docs=context_docs
+            )
+    
+    def get_similar_qa_pairs(self, question: str, limit: int = 3) -> List[Dict[str, str]]:
+        """Retrieve similar Q&A pairs based on question text."""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (q:Question)-[:HAS_ANSWER]->(a:Answer)
+                WHERE q.text CONTAINS $question OR $question CONTAINS q.text
+                RETURN q.text as question, a.text as answer, q.timestamp as timestamp
+                ORDER BY q.timestamp DESC
+                LIMIT $limit
+            """, question=question, limit=limit)
+            
+            return [{"question": record["question"],
+                    "answer": record["answer"],
+                    "timestamp": record["timestamp"]} 
+                    for record in result]
     
     def _create_patch_node(self, tx, patch_info: dict):
         """Create patch node and related changes."""
@@ -246,14 +302,136 @@ class EnhancedRetriever:
         self.knowledge_graph = Neo4jKnowledgeGraph(
             neo4j_uri, neo4j_user, neo4j_password
         )
-        self.index = None
         self.documents = []
         
         # Supported file types
         self.supported_files = {'.txt', '.md', '.py', '.patch'}
         
-        # Initialize or load document tracking
+        # Initialize document tracking
         self.processed_files = self._load_processed_files()
+        
+        # Load existing documents from Neo4j
+        self._load_existing_documents()
+        
+        # Initialize FAISS index with existing documents
+        dummy_embedding = self.embedding_model.encode(["dummy text"])[0]
+        self.embedding_dim = len(dummy_embedding)
+        self.index = faiss.IndexFlatL2(self.embedding_dim)
+        
+        # Add existing document embeddings to index
+        if self.documents:
+            embeddings = [doc.embedding for doc in self.documents if doc.embedding is not None]
+            if embeddings:
+                embeddings_array = np.array(embeddings).astype('float32')
+                self.index.add(embeddings_array)
+                logger.info(f"Loaded {len(embeddings)} existing document embeddings")
+        else:
+            logger.info("No existing documents found, starting with empty index")
+    
+    def _load_existing_documents(self):
+        """Load existing documents from Neo4j."""
+        try:
+            with self.knowledge_graph.driver.session() as session:
+                result = session.run("""
+                    MATCH (d:Document)
+                    RETURN d.filepath as filepath, d.content as content, 
+                           d.file_type as file_type, d.metadata as metadata
+                """)
+                
+                for record in result:
+                    # Create document object
+                    doc = Document(
+                        content=record["content"],
+                        filepath=record["filepath"],
+                        metadata=record.get("metadata", {})
+                    )
+                    
+                    # Generate embedding if needed
+                    if not hasattr(doc, 'embedding'):
+                        doc.embedding = self.embedding_model.encode(doc.content)
+                    
+                    self.documents.append(doc)
+                    
+                logger.info(f"Loaded {len(self.documents)} existing documents from Neo4j")
+        except Exception as e:
+            logger.error(f"Error loading existing documents: {e}")
+
+    def get_relevant_qa_history(self, question: str, limit: int = 5) -> List[Dict]:
+        """Get relevant question-answer pairs from history."""
+        return self.knowledge_graph.get_similar_qa_pairs(question, limit)
+    
+    def get_chat_context(self, question: str) -> str:
+        """Get combined context from documents and chat history."""
+        relevant_docs = self.retrieve(question)
+        qa_history = self.get_relevant_qa_history(question)
+        
+        context_parts = []
+        
+        # Add document context
+        if relevant_docs:
+            doc_context = "\n\n".join(doc.content for doc in relevant_docs)
+            context_parts.append(f"Relevant Documentation:\n{doc_context}")
+            
+        # Add chat history context
+        if qa_history:
+            chat_context = "\n\n".join([
+                f"Previous Q: {qa['question']}\nA: {qa['answer']}"
+                for qa in qa_history
+            ])
+            context_parts.append(f"Relevant Chat History:\n{chat_context}")
+            
+        return "\n\n---\n\n".join(context_parts) if context_parts else "No relevant context found"
+    
+    def retrieve(self, query: str, k: int = 3) -> List[Document]:
+        """Retrieve relevant documents using hybrid search."""
+        if len(self.documents) == 0:
+            # Return empty list for no documents
+            return []
+        
+        # Generate query embedding
+        query_embedding = self.embedding_model.encode([query])[0]
+        
+        # Adjust k to not exceed document count
+        k = min(k, len(self.documents))
+        if k == 0:
+            return []
+            
+        # FAISS similarity search
+        distances, indices = self.index.search(
+            np.array([query_embedding]).astype('float32'), k
+        )
+        
+        # Get relevant documents
+        relevant_docs = [self.documents[i] for i in indices[0]]
+        
+        return relevant_docs
+    
+    def retrieve(self, query: str, k: int = 3) -> List[Document]:
+        """Retrieve relevant documents using hybrid search."""
+        # For general queries that don't need context, return empty list
+        if any(word in query.lower() for word in [
+            'hello world', 'example', 'tutorial', 'basic', 'simple',
+            'how to', 'help me', 'what is', 'explain'
+        ]):
+            return []
+        
+        # If no documents are available, return empty list
+        if not self.documents:
+            return []
+            
+        # Generate query embedding
+        query_embedding = self.embedding_model.encode([query])[0]
+        
+        # FAISS similarity search
+        k = min(k, len(self.documents))  # Ensure k doesn't exceed number of documents
+        distances, indices = self.index.search(
+            np.array([query_embedding]).astype('float32'), k
+        )
+        
+        # Get relevant documents
+        relevant_docs = [self.documents[i] for i in indices[0]]
+        
+        return relevant_docs
     
     def _load_processed_files(self) -> set:
         """Load the set of already processed files."""
@@ -439,30 +617,414 @@ class DeepSeekRAG:
     
     def __init__(self, retriever: EnhancedRetriever):
         self.retriever = retriever
-        self.prompt_template = """
+        self.general_prompt_template = """
+You are a helpful AI assistant. Please help with the following request:
+
+{question}
+
+Please provide a clear and helpful response. If writing code, include comments explaining key parts.
+
+Response:
+"""
+        self.rag_prompt_template = """
+{system_context}
+
 Context information is below.
 ---------------------
 {context}
 ---------------------
-Given the context information and no other information, answer the following question:
+Similar previous questions and answers:
+{qa_history}
+---------------------
+Given the {available_info}, answer the following question:
 {question}
 
 Answer:
 """
     
+class DeepSeekRAG:
+    """Main RAG system using DeepSeek model."""
+    
+    def __init__(self, retriever: EnhancedRetriever):
+        self.retriever = retriever
+        self.prompt_template = """You are a helpful AI assistant with access to the following information:
+
+{context}
+
+Based on this context and your general knowledge, please help with the following question:
+
+{question}
+
+Provide a clear and detailed response. If writing code, include comments explaining key parts.
+If using information from the context, integrate it naturally into your response.
+
+Response:"""
+    
     def generate_answer(self, question: str) -> str:
         """Generate an answer using the DeepSeek model."""
         try:
-            # Retrieve relevant context
-            relevant_docs = self.retriever.retrieve(question)
-            context = "\n".join(doc.content for doc in relevant_docs)
+            # Validate ollama connection first
+            try:
+                import requests
+                requests.get("http://localhost:11434/api/health", timeout=1)
+            except requests.exceptions.RequestException:
+                return "Error: Unable to connect to ollama. Please ensure the ollama server is running."
+
+            # Get combined context from documents and chat history
+            context = self.retriever.get_chat_context(question)
             
             # Prepare the prompt
             prompt = self.prompt_template.format(
                 context=context,
                 question=question
             )
+            
+            # Generate response
+            response = ollama.generate(
+                model="deepseek-r1:1.5b",
+                prompt=prompt
+            )
+            
+            answer = response['response'].strip()
+            
+            # Store the Q&A pair
+            try:
+                relevant_docs = self.retriever.retrieve(question)
+                if relevant_docs:
+                    self.retriever.knowledge_graph.add_qa_pair(
+                        question=question,
+                        answer=answer,
+                        context_docs=[doc.filepath for doc in relevant_docs]
+                    )
+                else:
+                    self.retriever.knowledge_graph.add_qa_pair(
+                        question=question,
+                        answer=answer
+                    )
+            except Exception as e:
+                logger.warning(f"Error storing Q&A pair: {e}")
+            
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            return f"Error: {str(e)}"
+    
+    def generate_answer(self, question: str) -> str:
+        """Generate an answer using the DeepSeek model."""
+        try:
+            # Validate ollama connection first
+            try:
+                import requests
+                requests.get("http://localhost:11434/api/health", timeout=1)
+            except requests.exceptions.RequestException:
+                return "Error: Unable to connect to ollama. Please ensure the ollama server is running."
 
+            # For general queries, skip document retrieval entirely
+            if self._is_general_query(question):
+                prompt = f"""You are a helpful AI assistant. You specialize in providing clear explanations and example code.
+                
+Question: {question}
+
+Please provide a clear and helpful response. If writing code, include comments explaining key parts.
+
+Response:"""
+                
+                response = ollama.generate(
+                    model="deepseek-r1:1.5b",
+                    prompt=prompt
+                )
+                
+                answer = response['response'].strip()
+                
+                # Store the Q&A pair
+                try:
+                    self.retriever.knowledge_graph.add_qa_pair(question=question, answer=answer)
+                except Exception as e:
+                    logger.warning(f"Error storing Q&A pair: {e}")
+                
+                return answer
+            
+            # For document-specific queries, use the regular RAG approach
+            try:
+                relevant_docs = self.retriever.retrieve(question)
+            except Exception as e:
+                logger.warning(f"Error retrieving documents: {e}")
+                relevant_docs = []
+            
+            # Get similar Q&A pairs
+            try:
+                similar_qa = self.retriever.knowledge_graph.get_similar_qa_pairs(question)
+            except Exception as e:
+                logger.warning(f"Error retrieving Q&A pairs: {e}")
+                similar_qa = []
+            
+            # Prepare context and history
+            context = "\n".join(doc.content for doc in relevant_docs) if relevant_docs else "No relevant documents found."
+            qa_history = "\n\n".join([
+                f"Q: {qa['question']}\nA: {qa['answer']}"
+                for qa in similar_qa
+            ]) if similar_qa else "No similar questions found."
+            
+            # Build the prompt
+            prompt = f"""You are a helpful AI assistant analyzing the following question with available context.
+
+Context:
+{context}
+
+Previous Q&A:
+{qa_history}
+
+Question: {question}
+
+Please provide a comprehensive answer based on the available information.
+
+Response:"""
+            
+            response = ollama.generate(
+                model="deepseek-r1:1.5b",
+                prompt=prompt
+            )
+            
+            answer = response['response'].strip()
+            
+            # Store Q&A pair
+            try:
+                if relevant_docs:
+                    self.retriever.knowledge_graph.add_qa_pair(
+                        question=question,
+                        answer=answer,
+                        context_docs=[doc.filepath for doc in relevant_docs]
+                    )
+                else:
+                    self.retriever.knowledge_graph.add_qa_pair(
+                        question=question,
+                        answer=answer
+                    )
+            except Exception as e:
+                logger.warning(f"Error storing Q&A pair: {e}")
+            
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            return str(e)
+    
+    def generate_answer(self, question: str) -> str:
+        """Generate an answer using the DeepSeek model."""
+        try:
+            # Validate that ollama is running first
+            try:
+                import requests
+                requests.get("http://localhost:11434/api/health", timeout=1)
+            except requests.exceptions.RequestException:
+                return "Error: Unable to connect to ollama. Please ensure the ollama server is running."
+            
+            # Check if this is a general query
+            if self._is_general_query(question):
+                # Use simple prompt for general questions
+                prompt = self.general_prompt_template.format(question=question)
+            else:
+                # Retrieve relevant context and Q&A history for specific questions
+                try:
+                    relevant_docs = self.retriever.retrieve(question)
+                except Exception as e:
+                    logger.warning(f"Error retrieving documents: {e}")
+                    relevant_docs = []
+                
+                try:
+                    similar_qa = self.retriever.knowledge_graph.get_similar_qa_pairs(question)
+                except Exception as e:
+                    logger.warning(f"Error retrieving Q&A pairs: {e}")
+                    similar_qa = []
+                
+                context = "\n".join(doc.content for doc in relevant_docs) if relevant_docs else "No relevant documents found."
+                
+                has_docs = bool(relevant_docs)
+                has_qa_history = bool(similar_qa)
+                qa_history = "\n\n".join([
+                    f"Q: {qa['question']}\nA: {qa['answer']}"
+                    for qa in similar_qa
+                ]) if similar_qa else "No similar questions found."
+                
+                # Prepare system context
+                if has_docs and has_qa_history:
+                    system_context = "You have access to both relevant documentation and previous Q&A history."
+                    available_info = "context information and Q&A history"
+                elif has_docs:
+                    system_context = "You have access to relevant documentation but no previous Q&A history."
+                    available_info = "context information"
+                elif has_qa_history:
+                    system_context = "You have access to previous Q&A history but no relevant documentation."
+                    available_info = "Q&A history"
+                else:
+                    system_context = "You have no specific context or Q&A history available."
+                    available_info = "question"
+                
+                prompt = self.rag_prompt_template.format(
+                    system_context=system_context,
+                    context=context,
+                    qa_history=qa_history,
+                    available_info=available_info,
+                    question=question
+                )
+            
+            # Generate response using ollama
+            response = ollama.generate(
+                model="deepseek-r1:1.5b",
+                prompt=prompt
+            )
+            
+            answer = response['response'].strip()
+            
+            # Store Q&A pair in knowledge graph
+            try:
+                self.retriever.knowledge_graph.add_qa_pair(
+                    question=question,
+                    answer=answer
+                )
+            except Exception as e:
+                logger.warning(f"Error storing Q&A pair: {e}")
+            
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            return f"I apologize, but I encountered an error: {str(e)}"
+    
+    def generate_answer(self, question: str) -> str:
+        """Generate an answer using the DeepSeek model."""
+        try:
+            # Retrieve relevant context
+            try:
+                relevant_docs = self.retriever.retrieve(question)
+            except Exception as e:
+                logger.warning(f"Error retrieving documents: {e}")
+                relevant_docs = []
+            
+            # Get similar Q&A pairs
+            try:
+                similar_qa = self.retriever.knowledge_graph.get_similar_qa_pairs(question)
+            except Exception as e:
+                logger.warning(f"Error retrieving Q&A pairs: {e}")
+                similar_qa = []
+
+            # Validate that ollama is running
+            try:
+                import requests
+                requests.get("http://localhost:11434/api/health", timeout=1)
+            except requests.exceptions.RequestException:
+                return "Error: Unable to connect to ollama. Please ensure the ollama server is running."
+
+            # Handle general questions without context
+            if not relevant_docs and not similar_qa and not any(word in question.lower() 
+                for word in ['document', 'file', 'code base', 'repository', 'project']):
+                # This appears to be a general question, use simple prompt
+                prompt = self.general_prompt_template.format(question=question)
+            else:
+                # Use RAG prompt with available context
+                context = "\n".join(doc.content for doc in relevant_docs) if relevant_docs else "No relevant documents found."
+                
+                has_docs = bool(relevant_docs)
+                has_qa_history = bool(similar_qa)
+                qa_history = "\n\n".join([
+                    f"Q: {qa['question']}\nA: {qa['answer']}"
+                    for qa in similar_qa
+                ]) if similar_qa else "No similar questions found."
+                
+                # Prepare system context based on available information
+                if has_docs and has_qa_history:
+                    system_context = "You have access to both relevant documentation and previous Q&A history."
+                    available_info = "context information and Q&A history"
+                elif has_docs:
+                    system_context = "You have access to relevant documentation but no previous Q&A history."
+                    available_info = "context information"
+                elif has_qa_history:
+                    system_context = "You have access to previous Q&A history but no relevant documentation."
+                    available_info = "Q&A history"
+                else:
+                    system_context = "You have no specific context or Q&A history available."
+                    available_info = "question"
+                
+                prompt = self.rag_prompt_template.format(
+                    system_context=system_context,
+                    context=context,
+                    qa_history=qa_history,
+                    available_info=available_info,
+                    question=question
+                )
+            
+            # Call DeepSeek model using ollama
+            response = ollama.generate(
+                model="deepseek-r1:1.5b",
+                prompt=prompt
+            )
+            
+            answer = response['response'].strip()
+            
+            # Store Q&A pair in knowledge graph
+            try:
+                if relevant_docs:
+                    self.retriever.knowledge_graph.add_qa_pair(
+                        question=question,
+                        answer=answer,
+                        context_docs=[doc.filepath for doc in relevant_docs]
+                    )
+                else:
+                    self.retriever.knowledge_graph.add_qa_pair(
+                        question=question,
+                        answer=answer
+                    )
+            except Exception as e:
+                logger.warning(f"Error storing Q&A pair: {e}")
+            
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            return f"I apologize, but I encountered an error generating the response: {str(e)}"
+    
+    def generate_answer(self, question: str) -> str:
+        """Generate an answer using the DeepSeek model."""
+        try:
+            # Retrieve relevant context
+            relevant_docs = self.retriever.retrieve(question)
+            
+            # Determine what information is available
+            has_docs = bool(relevant_docs)
+            context = "\n".join(doc.content for doc in relevant_docs) if relevant_docs else "No relevant documents found."
+            
+            # Get similar Q&A pairs
+            similar_qa = self.retriever.knowledge_graph.get_similar_qa_pairs(question)
+            has_qa_history = bool(similar_qa)
+            qa_history = "\n\n".join([
+                f"Q: {qa['question']}\nA: {qa['answer']}"
+                for qa in similar_qa
+            ]) if similar_qa else "No similar questions found."
+            
+            # Prepare system context based on available information
+            if has_docs and has_qa_history:
+                system_context = "You have access to both relevant documentation and previous Q&A history."
+                available_info = "context information and Q&A history"
+            elif has_docs:
+                system_context = "You have access to relevant documentation but no previous Q&A history."
+                available_info = "context information"
+            elif has_qa_history:
+                system_context = "You have access to previous Q&A history but no relevant documentation."
+                available_info = "Q&A history"
+            else:
+                system_context = "You have no specific context or Q&A history available."
+                available_info = "question"
+            
+            # Prepare the prompt
+            prompt = self.prompt_template.format(
+                system_context=system_context,
+                context=context,
+                qa_history=qa_history,
+                available_info=available_info,
+                question=question
+            )
+            
             # Validate that ollama is running
             try:
                 import requests
@@ -476,8 +1038,26 @@ Answer:
                 prompt=prompt
             )
             
-            # Extract the response text - ollama.generate returns a dict with 'response' key
-            return response['response'].strip()
+            answer = response['response'].strip()
+            
+            # Store Q&A pair in knowledge graph
+            if relevant_docs:  # Only store context docs if we have any
+                self.retriever.knowledge_graph.add_qa_pair(
+                    question=question,
+                    answer=answer,
+                    context_docs=[doc.filepath for doc in relevant_docs]
+                )
+            else:
+                self.retriever.knowledge_graph.add_qa_pair(
+                    question=question,
+                    answer=answer
+                )
+            
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            return f"I apologize, but I encountered an error generating the response: {str(e)}"
             
         except Exception as e:
             logger.error(f"Error generating response: {e}")
@@ -594,7 +1174,12 @@ async def main():
         # Load documents if directory is provided
         if docs_dir and Path(docs_dir).exists():
             logger.info(f"Loading documents from: {docs_dir}")
-            retriever.add_documents(docs_dir, force_reload=args.force_reload)
+            # Document loading is now handled gracefully inside add_documents
+            try:
+                retriever.add_documents(docs_dir, force_reload=args.force_reload)
+            except Exception as e:
+                logger.error(f"Error adding documents: {e}")
+                # Continue even if document loading fails
         else:
             logger.info("No documents directory provided or directory doesn't exist. Starting with existing index.")
         
