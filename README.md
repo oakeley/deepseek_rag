@@ -49,6 +49,7 @@ conda install -c conda-forge faiss-cpu
 # Or for GPU support (replace '12.1' with your CUDA version)
 # conda install -c pytorch -c nvidia pytorch torchvision torchaudio pytorch-cuda=12.1
 # conda install -c conda-forge faiss-gpu
+```
 
 
 5. Install other required packages via pip:
