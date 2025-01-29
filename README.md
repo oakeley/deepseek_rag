@@ -42,13 +42,13 @@ conda activate deepseek
 
 4. Install PyTorch and FAISS using Conda:
 ```bash
-# CPU-only version
-conda install -c pytorch -c nvidia pytorch torchvision torchaudio cpuonly
-conda install -c conda-forge faiss-cpu
+# Nvidia GPU support (replace '12.1' with your CUDA version)
+conda install -c pytorch -c nvidia pytorch torchvision torchaudio pytorch-cuda=12.1
+conda install -c conda-forge faiss-gpu
 
-# Or for GPU support (replace '12.1' with your CUDA version)
-# conda install -c pytorch -c nvidia pytorch torchvision torchaudio pytorch-cuda=12.1
-# conda install -c conda-forge faiss-gpu
+# Or for CPU-only version (verrrry slow)
+# conda install -c pytorch -c nvidia pytorch torchvision torchaudio cpuonly
+# conda install -c conda-forge faiss-cpu
 ```
 
 
