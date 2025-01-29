@@ -13,7 +13,7 @@ A Retrieval-Augmented Generation (RAG) system that combines document analysis, k
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.12
 - Neo4j Database Server
 - Ollama with DeepSeek model
 
@@ -34,32 +34,43 @@ curl https://ollama.ai/install.sh | sh
 ollama pull deepseek-r1:1.5b
 ```
 
-3. Install Python dependencies:
+3. Create and activate Conda environment:
 ```bash
-pip install -r requirements.txt
+conda create -n deepseek python=3.12
+conda activate deepseek
 ```
 
-Contents of `requirements.txt`:
+4. Install PyTorch and FAISS using Conda:
+```bash
+# CPU-only version
+conda install -c pytorch -c nvidia pytorch torchvision torchaudio cpuonly
+conda install -c conda-forge faiss-cpu
+
+# Or for GPU support (replace '12.1' with your CUDA version)
+# conda install -c pytorch -c nvidia pytorch torchvision torchaudio pytorch-cuda=12.1
+# conda install -c conda-forge faiss-gpu
+
+
+5. Install other required packages via pip:
+```bash
+pip install sentence-transformers \
+            transformers \
+            neo4j \
+            numpy \
+            pandas \
+            requests \
+            python-dotenv \
+            httpx \
+            ollama
 ```
-sentence-transformers
-faiss-cpu  # or faiss-gpu for GPU support
-neo4j
-torch
-transformers
-numpy
-ollama
-requests
-```
+
 
 ## Configuration
 
-1. Configure Neo4j:
+1. Always start Neo4j in a window:
 ```bash
 # Start Neo4j service
-sudo service neo4j start
-
-# Set Neo4j password (first time)
-neo4j-admin set-initial-password your_password
+docker-compose -f docker-compose-neo4j.yml up
 ```
 
 2. Set environment variables (optional):
