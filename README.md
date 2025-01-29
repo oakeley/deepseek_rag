@@ -23,6 +23,7 @@ A Retrieval-Augmented Generation (RAG) system that combines document analysis, k
 ```bash
 # Install Neo4j (Ubuntu/Debian)
 sudo apt install neo4j
+docker-compose -f docker-compose-neo4j.yml up
 
 # Install Ollama
 curl https://ollama.ai/install.sh | sh
