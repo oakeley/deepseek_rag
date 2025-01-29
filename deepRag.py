@@ -647,18 +647,125 @@ class DeepSeekRAG:
     
     def __init__(self, retriever: EnhancedRetriever):
         self.retriever = retriever
-        self.prompt_template = """You are a helpful AI assistant with access to the following information:
+        self.prompt_template = """You are a helpful AI assistant. Please follow these guidelines:
+1. Prioritize information from the documentation and database (marked as [DB_INFO])
+2. If documentation/database information exists, use it as the primary source
+3. You can supplement with general knowledge and previous answers (marked as [PREV_ANS])
+4. For code examples, include clear comments and explanations
 
+Available information:
 {context}
 
-Based on this context and your general knowledge, please help with the following question:
+Question: {question}
 
-{question}
-
-Provide a clear and detailed response. If writing code, include comments explaining key parts.
-If using information from the context, integrate it naturally into your response.
+Response instructions:
+- First discuss any relevant database/documentation information
+- Then add any supplementary information from previous answers or general knowledge
+- If writing code, include thorough comments
 
 Response:"""
+
+    def _analyze_response(self, response: str) -> bool:
+        """Analyze if a response contains database information."""
+        # Check if response references database content
+        db_indicators = ['from the documentation', 'in the codebase', 'according to the docs',
+                        'the database shows', 'the documents indicate', 'based on the repository']
+        return any(indicator in response.lower() for indicator in db_indicators)
+
+    def _format_context(self, question: str) -> str:
+        """Format context with clear separation of sources."""
+        # Get document context
+        relevant_docs = self.retriever.retrieve(question)
+        doc_context = ""
+        if relevant_docs:
+            doc_texts = [doc.content for doc in relevant_docs]
+            doc_context = "[DB_INFO]\n" + "\n\n".join(doc_texts)
+
+        # Get chat history
+        qa_history = self.retriever.get_relevant_qa_history(question)
+        chat_context = ""
+        if qa_history:
+            qa_texts = [f"Q: {qa['question']}\nA: {qa['answer']}" for qa in qa_history]
+            chat_context = "[PREV_ANS]\n" + "\n\n".join(qa_texts)
+
+        # Combine contexts with clear separation
+        contexts = []
+        if doc_context:
+            contexts.append(doc_context)
+        if chat_context:
+            contexts.append(chat_context)
+
+        return "\n\n---\n\n".join(contexts) if contexts else "No historical information available."
+
+    def generate_answer(self, question: str) -> str:
+        """Generate an answer using the DeepSeek model."""
+        try:
+            # Validate ollama connection
+            try:
+                import requests
+                requests.get("http://localhost:11434/api/health", timeout=1)
+            except requests.exceptions.RequestException:
+                return "Error: Unable to connect to ollama. Please ensure the ollama server is running."
+
+            # Get formatted context
+            context = self._format_context(question)
+
+            # First attempt: prioritize database information
+            prompt = self.prompt_template.format(
+                context=context,
+                question=question
+            )
+
+            response = ollama.generate(
+                model="deepseek-r1:1.5b",
+                prompt=prompt
+            )
+            answer = response['response'].strip()
+
+            # Check if the response contains database information
+            has_db_info = self._analyze_response(answer)
+
+            # If no database info was used but we have previous answers,
+            # try again with modified prompt
+            if not has_db_info and "[PREV_ANS]" in context:
+                modified_prompt = self.prompt_template.format(
+                    context=context + "\n\nNote: If possible, try to verify or enhance the previous answer with your general knowledge.",
+                    question=question
+                )
+                
+                response = ollama.generate(
+                    model="deepseek-r1:1.5b",
+                    prompt=modified_prompt
+                )
+                answer = response['response'].strip()
+
+            # Store the Q&A pair with source information
+            try:
+                metadata = {
+                    'has_db_info': has_db_info,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                relevant_docs = self.retriever.retrieve(question)
+                if relevant_docs:
+                    self.retriever.knowledge_graph.add_qa_pair(
+                        question=question,
+                        answer=answer,
+                        context_docs=[doc.filepath for doc in relevant_docs]
+                    )
+                else:
+                    self.retriever.knowledge_graph.add_qa_pair(
+                        question=question,
+                        answer=answer
+                    )
+            except Exception as e:
+                logger.warning(f"Error storing Q&A pair: {e}")
+
+            return answer
+
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            return f"Error: {str(e)}"
     
     def generate_answer(self, question: str) -> str:
         """Generate an answer using the DeepSeek model."""
